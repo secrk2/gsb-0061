@@ -55,6 +55,7 @@ async function api(path, opts = {}) {
     headers: {
       "Content-Type": "application/json",
       ...(state.token ? { "X-Token": state.token } : {}),
+      ...(opts.headers || {}),
     },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
@@ -706,6 +707,11 @@ function openAppModal(app) {
   const isEdit = !!app;
   const isAdmin = state.user.role === "admin";
   const root = $("#modal-root");
+  // 每次打开「新建」弹窗生成一个幂等键：网络卡顿时的重试/连点都会带同一个键，
+  // 服务端凭键识别"同一次提交"，只落一条台账；重新打开弹窗才换新键。
+  const createKey = "crt-" + (window.crypto && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Date.now() + "-" + Math.random().toString(36).slice(2));
   const ownerOptions = (blId) => state.users
     .filter((u) => !blId || String(u.business_line_id) === String(blId))
     .map((u) => `<option value="${u.id}" ${app && app.owner_id === u.id ? "selected" : ""}>${esc(u.name)}</option>`).join("");
@@ -781,6 +787,14 @@ function openAppModal(app) {
     errBox.classList.remove("show");
     const name = $("#m-name").value.trim();
     if (!name) { errBox.textContent = "应用名称不能为空"; errBox.classList.add("show"); return; }
+    const submitBtn = $("#m-submit");
+    if (submitBtn.disabled) return;  // 请求在途：网络再卡也不重复发第二回
+    submitBtn.disabled = true;
+    submitBtn.textContent = "提交中…";
+    const restoreBtn = () => {
+      submitBtn.disabled = false;
+      submitBtn.textContent = isEdit ? "保存" : "创建";
+    };
     try {
       if (isEdit) {
         await api(`/api/apps/${app.id}`, {
@@ -800,6 +814,7 @@ function openAppModal(app) {
       } else {
         await api("/api/apps", {
           method: "POST",
+          headers: { "Idempotency-Key": createKey },
           body: {
             name,
             business_line_id: +blSel.value,
@@ -814,7 +829,8 @@ function openAppModal(app) {
         renderApps();
       }
     } catch (e) {
-      // 重名 409 / 校验失败等：表单内展示原因
+      // 重名 409 / 校验失败等：表单内展示原因，并恢复按钮允许修正后重试
+      restoreBtn();
       errBox.textContent = e.message;
       errBox.classList.add("show");
     }

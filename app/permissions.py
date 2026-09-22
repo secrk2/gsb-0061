@@ -227,9 +227,11 @@ def deny_reason(user: dict, bl_id: int, env: str | None, perm: str,
 # ---------------------------------------------------------------- 单资源守卫
 
 def ensure_app_visible(user: dict, app_row: dict) -> None:
-    """应用台账（按应用所属环境判定）可见性。"""
-    if app_row.get("owner_id") is None:
-        return
+    """应用台账（按应用所属环境判定）可见性。
+
+    负责人空缺不等于公开：归属校验照常按 管理员 / 本业务线负责人 /
+    应用负责人本人 / 显式授权 收口，缺负责人只是没有"负责人本人"这一条。
+    """
     if is_admin(user) or is_bl_owner(user, app_row["business_line_id"]):
         return
     owns = app_row["id"] in user.get("_owned_apps", set())

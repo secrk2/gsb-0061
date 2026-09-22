@@ -438,16 +438,57 @@ CREATE TABLE IF NOT EXISTS app_modules (
 CREATE INDEX IF NOT EXISTS idx_modules_app ON app_modules(app_id);
 CREATE INDEX IF NOT EXISTS idx_modules_src ON app_modules(source_id);
 CREATE INDEX IF NOT EXISTS idx_tomb_entity ON sync_tombstones(entity, source_id);
+
+-- ====================================================================
+-- 写操作幂等键（当前用于新建应用）：网络抖动/双击导致同一表单被提交多次时，
+-- 服务端凭 (key, user_id, endpoint) 识别"同一次提交"，直接返回首次创建的结果，
+-- 不再重复落库。payload_hash 用于区分"重试"与"改了内容又提交"。
+-- ====================================================================
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key         TEXT NOT NULL,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    endpoint    TEXT NOT NULL,
+    resource_id INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (key, user_id, endpoint)
+);
 """
 
 _local = threading.local()
+
+# ---------------------------------------------------------------- 数据版本
+# 任何连接上的 commit 都推进全局数据版本号：控制台等读侧缓存按版本号失效，
+# 写操作（状态流转/新建/同步落地/实例事件……）提交后下一次读立即看到新数据，
+# 不再依赖 TTL 到期。
+_data_version = 0
+_data_version_lock = threading.Lock()
+
+
+def data_version() -> int:
+    with _data_version_lock:
+        return _data_version
+
+
+def _bump_data_version() -> None:
+    global _data_version
+    with _data_version_lock:
+        _data_version += 1
+
+
+class _ZhiyunConnection(sqlite3.Connection):
+    """commit 时推进数据版本的连接（rollback 不推进——数据没有变化）。"""
+
+    def commit(self) -> None:
+        super().commit()
+        _bump_data_version()
 
 
 def get_conn() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
     if conn is None:
         os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn = sqlite3.connect(DB_PATH, timeout=10, factory=_ZhiyunConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         _local.conn = conn
@@ -460,6 +501,7 @@ def init_db() -> None:
     _migrate_legacy(conn)
     _migrate_env_checks(conn)
     _migrate_sync_columns(conn)
+    _migrate_apps_name_unique(conn)
     _backfill_app_environments(conn)
     _repair_audit_environment(conn)
     conn.commit()
@@ -652,6 +694,35 @@ def _migrate_sync_columns(conn) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_appenv_source_id "
         "ON app_environments(source_id) WHERE source_id IS NOT NULL")
+
+
+def _migrate_apps_name_unique(conn) -> None:
+    """给老库补 applications(business_line_id, name) 唯一索引（新库建表已自带）。
+
+    唯一性此前只靠应用层查重，查重一旦被绕过（如并发双交）就会产生
+    "同业务线同名"的两条台账。这里在数据库层兜底；但若存量数据里已经存在
+    同名重复记录，索引建不起来——历史台账一条都不删改，跳过索引并告警，
+    新增重复由应用层查重 + 幂等键拦截。
+    """
+    for idx in conn.execute("PRAGMA index_list('applications')").fetchall():
+        if not idx["unique"]:
+            continue
+        cols = [r["name"] for r in conn.execute(
+            f"PRAGMA index_info('{idx['name']}')").fetchall()]
+        if cols == ["business_line_id", "name"]:
+            return
+    dup = conn.execute(
+        """SELECT business_line_id, name, COUNT(*) AS c FROM applications
+           GROUP BY business_line_id, name HAVING c > 1 LIMIT 1"""
+    ).fetchone()
+    if dup:
+        print(f"[zhiyun] 警告：台账已存在同名重复记录（业务线 #{dup['business_line_id']} "
+              f"「{dup['name']}」×{dup['c']}），跳过唯一索引创建；历史记录原样保留，"
+              f"新增重复由应用层查重与幂等键拦截。")
+        return
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_bl_name "
+        "ON applications(business_line_id, name)")
 
 
 def _migrate_legacy(conn) -> None:

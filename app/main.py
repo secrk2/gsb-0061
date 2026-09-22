@@ -1,8 +1,11 @@
 """织云系统 - 应用台账 & 资产控制台 API。"""
+import hashlib
+import json
 import os
+import sqlite3
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -16,7 +19,7 @@ from .auth import (
 )
 from .db import (
     CLUSTERS, ENV_LABELS, ENVIRONMENTS, ROLES, ROLE_LABELS, STATUS_LABELS, STATUS_ORDER,
-    STATUSES, TERMINAL_STATUS, execute, get_conn, init_db, query, query_one,
+    STATUSES, TERMINAL_STATUS, data_version, execute, get_conn, init_db, query, query_one,
 )
 from .routers import admin as admin_router
 from .routers import config as config_router
@@ -25,9 +28,6 @@ from .routers import sync as sync_router
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-
-# 控制台状态流转提示文案
-STATUS_TIPS = {s: STATUS_HINTS[s] for s in STATUSES}
 
 app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
@@ -296,7 +296,8 @@ def list_apps(user: dict = User,
 
 
 @app.post("/api/apps", status_code=201)
-def create_app(body: AppCreateIn, user: dict = User):
+def create_app(body: AppCreateIn, user: dict = User,
+               idempotency_key: str | None = Header(default=None)):
     # 新建应用属于业务线管理动作：平台管理员或该业务线负责人
     perms.ensure_can_manage_bl(user, body.business_line_id)
     if body.environment not in ENVIRONMENTS:
@@ -311,23 +312,71 @@ def create_app(body: AppCreateIn, user: dict = User):
             raise err(400, "负责人必须属于应用所在业务线")
         if owner["role"] == "viewer":
             raise err(400, "只读观察者不能担任应用负责人；如需指定，请先由平台管理员调整其角色")
-    dup = query_one("SELECT id FROM applications WHERE business_line_id = ? AND name = ?",
-                    (body.name.strip(), body.business_line_id))
-    if dup:
-        raise err(409, f"同一业务线下应用名不能重复：「{body.name.strip()}」已存在（应用 #{dup['id']}）")
-    now = int(time.time())
-    cur = execute(
-        """INSERT INTO applications
-           (name, business_line_id, owner_id, cluster, environment, status,
-            description, created_at, updated_at)
-           VALUES (?,?,?,?,?,'developing',?,?,?)""",
-        (body.name.strip(), body.business_line_id, body.owner_id, body.cluster,
-         body.environment, body.description.strip(), now, now),
-    )
-    log_change(cur.lastrowid, user["id"], "创建应用", f"应用「{body.name.strip()}」创建，初始状态：在研")
+    name = body.name.strip()
+    # 幂等键：网络抖动/双击导致同一表单被提交多次时，凭键识别"同一次提交"，
+    # 直接返回首次创建的应用，绝不再落第二条台账。
+    idem = (idempotency_key or "").strip()[:128] or None
+    payload_hash = hashlib.sha256(json.dumps({
+        "name": name, "business_line_id": body.business_line_id,
+        "owner_id": body.owner_id, "cluster": body.cluster,
+        "environment": body.environment, "description": body.description.strip(),
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    conn = get_conn()
+    try:
+        # 查重与写入包在同一个 IMMEDIATE 事务里：并发提交在数据库层串行化，
+        # 后到者能读到先到者的结果，要么命中幂等键、要么撞唯一约束转 409，
+        # 不会出现"检查时都说不存在、然后各插一条"。
+        conn.execute("BEGIN IMMEDIATE")
+        if idem:
+            hit = conn.execute(
+                """SELECT resource_id, payload_hash FROM idempotency_keys
+                   WHERE key=? AND user_id=? AND endpoint='create_app'""",
+                (idem, user["id"]),
+            ).fetchone()
+            if hit:
+                conn.rollback()
+                if hit["payload_hash"] != payload_hash:
+                    raise err(409, "检测到同一表单被重复提交且内容有变化：上一次提交其实已成功，"
+                                   "请先刷新台账列表确认，再决定是修改还是重新创建。")
+                data = app_to_dict(get_app_or_404(hit["resource_id"]), with_env=True)
+                data["deduplicated"] = True
+                return data
+        dup = conn.execute(
+            "SELECT id FROM applications WHERE business_line_id = ? AND name = ?",
+            (body.business_line_id, name),
+        ).fetchone()
+        if dup:
+            raise err(409, f"同一业务线下应用名不能重复：「{name}」已存在（应用 #{dup['id']}）")
+        now = int(time.time())
+        cur = conn.execute(
+            """INSERT INTO applications
+               (name, business_line_id, owner_id, cluster, environment, status,
+                description, created_at, updated_at)
+               VALUES (?,?,?,?,?,'developing',?,?,?)""",
+            (name, body.business_line_id, body.owner_id, body.cluster,
+             body.environment, body.description.strip(), now, now),
+        )
+        app_id = cur.lastrowid
+        if idem:
+            conn.execute(
+                """INSERT INTO idempotency_keys
+                   (key, user_id, endpoint, resource_id, payload_hash, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (idem, user["id"], "create_app", app_id, payload_hash, now),
+            )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # 数据库唯一约束兜底（并发同名/并发同幂等键）：转成明确的 409 而非 500
+        conn.rollback()
+        raise err(409, f"同一业务线下应用名不能重复：「{name}」（并发提交被唯一约束拦截）")
+    except BaseException:
+        conn.rollback()
+        raise
+    log_change(app_id, user["id"], "创建应用", f"应用「{name}」创建，初始状态：在研")
     # 环境改为每应用注册表：新建即开通四个标准环境（窗口默认值见 DEFAULT_WINDOWS）
-    esvc.ensure_default_environments(cur.lastrowid, now)
-    return app_to_dict(get_app_or_404(cur.lastrowid), with_env=True)
+    esvc.ensure_default_environments(app_id, now)
+    return app_to_dict(get_app_or_404(app_id), with_env=True)
 
 
 @app.get("/api/apps/{app_id}")
@@ -458,10 +507,18 @@ def put_env_vars(app_id: int, body: EnvVarsIn, user: dict = User):
 
 _CONSOLE_CACHE: dict = {}
 _CONSOLE_CACHE_TTL = 300
+_CONSOLE_CACHE_VER = -1
 
 
 @app.get("/api/console/summary")
 def console_summary(user: dict = User):
+    global _CONSOLE_CACHE_VER
+    # 缓存按数据版本失效：任何写操作（状态流转/新建/同步落地/实例事件等）提交后，
+    # 版本号即推进，下一次汇总立刻重算；TTL 只是兜底，不再承担正确性。
+    ver = data_version()
+    if ver != _CONSOLE_CACHE_VER:
+        _CONSOLE_CACHE.clear()
+        _CONSOLE_CACHE_VER = ver
     _cache_key = (user["id"], is_admin(user))
     _hit = _CONSOLE_CACHE.get(_cache_key)
     if _hit and int(time.time()) - _hit[0] < _CONSOLE_CACHE_TTL:
