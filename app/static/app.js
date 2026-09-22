@@ -705,6 +705,11 @@ async function transitionStatus(appId, toStatus) {
 function openAppModal(app) {
   const isEdit = !!app;
   const isAdmin = state.user.role === "admin";
+  // 新建幂等键：每次打开弹窗生成一次；网络卡顿重试/连点保存都会带同一个键，
+  // 服务端凭键只受理第一次，重复提交返回首次创建的应用，不会产生重复台账
+  const clientRequestId = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `crid-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const root = $("#modal-root");
   const ownerOptions = (blId) => state.users
     .filter((u) => !blId || String(u.business_line_id) === String(blId))
@@ -781,6 +786,12 @@ function openAppModal(app) {
     errBox.classList.remove("show");
     const name = $("#m-name").value.trim();
     if (!name) { errBox.textContent = "应用名称不能为空"; errBox.classList.add("show"); return; }
+    const submitBtn = $("#m-submit");
+    // 提交期间禁用按钮：网络卡顿时连点/重发只会发出一个请求
+    if (submitBtn.disabled) return;
+    submitBtn.disabled = true;
+    submitBtn.textContent = "提交中…";
+    const restore = () => { submitBtn.disabled = false; submitBtn.textContent = isEdit ? "保存" : "创建"; };
     try {
       if (isEdit) {
         await api(`/api/apps/${app.id}`, {
@@ -807,6 +818,7 @@ function openAppModal(app) {
             cluster: $("#m-cluster").value,
             environment: $("#m-env").value,
             description: $("#m-desc").value.trim(),
+            client_request_id: clientRequestId,
           },
         });
         toast(`应用「${name}」创建成功（初始状态：在研）`, "success");
@@ -814,9 +826,10 @@ function openAppModal(app) {
         renderApps();
       }
     } catch (e) {
-      // 重名 409 / 校验失败等：表单内展示原因
+      // 重名 409 / 校验失败等：表单内展示原因；网络失败可带同一幂等键安全重试
       errBox.textContent = e.message;
       errBox.classList.add("show");
+      restore();
     }
   };
 }

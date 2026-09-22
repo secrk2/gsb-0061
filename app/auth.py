@@ -78,10 +78,10 @@ def get_app_writable(user: dict, app_id: int, what: str = "应用信息") -> dic
     """台账写操作（改信息/状态/环境变量）：管理员、本业务线负责人、应用负责人本人。
 
     只读观察者与无编辑权账号一律拦下并说明原因。
+    负责人空缺不放开写权限：归属未定期间仅平台管理员与本业务线负责人可改，
+    避免其他业务线人员越权改动且留痕记到无关账号名下。
     """
     app_row = get_app_or_404(app_id)
-    if app_row["owner_id"] is None:
-        return app_row
     if perms.is_admin(user) or perms.is_bl_owner(user, app_row["business_line_id"]):
         return app_row
     if app_row["id"] in user.get("_owned_apps", set()) and user["role"] != "viewer":

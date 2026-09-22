@@ -143,6 +143,17 @@ CREATE TABLE IF NOT EXISTS change_logs (
     created_at INTEGER NOT NULL
 );
 
+-- 新建应用幂等键：前端每次打开新建弹窗生成一个 client_request_id，
+-- 网络卡顿/重试/重复点击会带着同一个键重发，服务端凭 (用户, 键) 只受理第一次，
+-- 后续重发直接返回首次创建的应用，不再产生重复台账与重复留痕。
+CREATE TABLE IF NOT EXISTS app_create_idempotency (
+    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_request_id TEXT NOT NULL,
+    app_id            INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    created_at        INTEGER NOT NULL,
+    PRIMARY KEY (user_id, client_request_id)
+);
+
 -- 配置档案：配置项按 应用 + 环境 管理（键、值、类型、生效范围、是否密文）
 CREATE TABLE IF NOT EXISTS config_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

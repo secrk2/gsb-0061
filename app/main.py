@@ -1,5 +1,6 @@
 """织云系统 - 应用台账 & 资产控制台 API。"""
 import os
+import sqlite3
 import time
 
 from fastapi import FastAPI
@@ -25,9 +26,6 @@ from .routers import sync as sync_router
 from .seed import seed_if_empty
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-
-# 控制台状态流转提示文案
-STATUS_TIPS = {s: STATUS_HINTS[s] for s in STATUSES}
 
 app = FastAPI(title="织云系统", docs_url=None, redoc_url=None)
 app.include_router(config_router.router)
@@ -105,6 +103,9 @@ class AppCreateIn(BaseModel):
     cluster: str
     environment: str
     description: str = ""
+    # 幂等键：前端每次打开新建弹窗生成一次；网络重试/重复提交带同一键重发时，
+    # 服务端只受理第一次，后续重发返回首次创建的应用，不产生重复台账
+    client_request_id: str | None = Field(default=None, max_length=64)
 
 
 class AppUpdateIn(BaseModel):
@@ -311,23 +312,67 @@ def create_app(body: AppCreateIn, user: dict = User):
             raise err(400, "负责人必须属于应用所在业务线")
         if owner["role"] == "viewer":
             raise err(400, "只读观察者不能担任应用负责人；如需指定，请先由平台管理员调整其角色")
+    name = body.name.strip()
+    crid = (body.client_request_id or "").strip() or None
+
+    # 幂等短路：同一账号带着同一个 client_request_id 重发（网络卡顿重试、
+    # 连点保存），直接返回首次创建的应用——不重复建台账、不重复写留痕
+    if crid:
+        prev = query_one(
+            "SELECT app_id FROM app_create_idempotency WHERE user_id = ? AND client_request_id = ?",
+            (user["id"], crid),
+        )
+        if prev:
+            data = app_to_dict(get_app_or_404(prev["app_id"]), with_env=True)
+            data["deduplicated"] = True
+            return data
+
     dup = query_one("SELECT id FROM applications WHERE business_line_id = ? AND name = ?",
-                    (body.name.strip(), body.business_line_id))
+                    (body.business_line_id, name))
     if dup:
-        raise err(409, f"同一业务线下应用名不能重复：「{body.name.strip()}」已存在（应用 #{dup['id']}）")
+        raise err(409, f"同一业务线下应用名不能重复：「{name}」已存在（应用 #{dup['id']}）")
     now = int(time.time())
-    cur = execute(
-        """INSERT INTO applications
-           (name, business_line_id, owner_id, cluster, environment, status,
-            description, created_at, updated_at)
-           VALUES (?,?,?,?,?,'developing',?,?,?)""",
-        (body.name.strip(), body.business_line_id, body.owner_id, body.cluster,
-         body.environment, body.description.strip(), now, now),
-    )
-    log_change(cur.lastrowid, user["id"], "创建应用", f"应用「{body.name.strip()}」创建，初始状态：在研")
+    # 应用行与幂等键同事务落库：任一步失败整体回滚，不留半截数据；
+    # 唯一约束（业务线+名称 / 用户+幂等键）在并发与重试下兜底，冲突按 409 处理而非 500
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO applications
+               (name, business_line_id, owner_id, cluster, environment, status,
+                description, created_at, updated_at)
+               VALUES (?,?,?,?,?,'developing',?,?,?)""",
+            (name, body.business_line_id, body.owner_id, body.cluster,
+             body.environment, body.description.strip(), now, now),
+        )
+        app_id = cur.lastrowid
+        if crid:
+            conn.execute(
+                "INSERT INTO app_create_idempotency (user_id, client_request_id, app_id, created_at) "
+                "VALUES (?,?,?,?)",
+                (user["id"], crid, app_id, now),
+            )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        if crid:
+            # 并发的同键请求已先一步落库：以它创建的应用为准，本次不再产生新记录
+            prev = query_one(
+                "SELECT app_id FROM app_create_idempotency WHERE user_id = ? AND client_request_id = ?",
+                (user["id"], crid),
+            )
+            if prev:
+                data = app_to_dict(get_app_or_404(prev["app_id"]), with_env=True)
+                data["deduplicated"] = True
+                return data
+        dup = query_one("SELECT id FROM applications WHERE business_line_id = ? AND name = ?",
+                        (body.business_line_id, name))
+        if dup:
+            raise err(409, f"同一业务线下应用名不能重复：「{name}」已存在（应用 #{dup['id']}）")
+        raise
+    log_change(app_id, user["id"], "创建应用", f"应用「{name}」创建，初始状态：在研")
     # 环境改为每应用注册表：新建即开通四个标准环境（窗口默认值见 DEFAULT_WINDOWS）
-    esvc.ensure_default_environments(cur.lastrowid, now)
-    return app_to_dict(get_app_or_404(cur.lastrowid), with_env=True)
+    esvc.ensure_default_environments(app_id, now)
+    return app_to_dict(get_app_or_404(app_id), with_env=True)
 
 
 @app.get("/api/apps/{app_id}")
@@ -456,16 +501,11 @@ def put_env_vars(app_id: int, body: EnvVarsIn, user: dict = User):
 
 # ---------------------------------------------------------------- 资产控制台
 
-_CONSOLE_CACHE: dict = {}
-_CONSOLE_CACHE_TTL = 300
-
-
 @app.get("/api/console/summary")
 def console_summary(user: dict = User):
-    _cache_key = (user["id"], is_admin(user))
-    _hit = _CONSOLE_CACHE.get(_cache_key)
-    if _hit and int(time.time()) - _hit[0] < _CONSOLE_CACHE_TTL:
-        return _hit[1]
+    # 作战台必须实时反映台账变化：状态流转、交接、同步落地、实例事件都会改变
+    # 这里的统计，写入路径分散在多个模块，任何进程内缓存都无法可靠失效
+    # （曾按 300s TTL 缓存，导致下线后作战台长时间仍按旧状态统计），故每次实时计算。
     if is_admin(user):
         scope_sql, scope_params = "1=1", []
     else:
@@ -534,7 +574,6 @@ def console_summary(user: dict = User):
             "red_dot_apps": len({a["id"] for a in missing_owner} | {a["id"] for a in missing_env}),
         },
     }
-    _CONSOLE_CACHE[_cache_key] = (int(time.time()), result)
     return result
 
 
